@@ -1,43 +1,80 @@
 // For more information, see https://crawlee.dev/
 import { Actor } from 'apify';
-import { PlaywrightCrawler, log } from 'crawlee';
+import { PlaywrightCrawler } from 'crawlee';
+import winston from 'winston';
+import pkg from 'proxy-chain';
+const { ProxyChain } = pkg;
+import promClient from 'prom-client';
+import Joi from 'joi';
+
+// Cấu hình logger
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.json(),
+    transports: [
+        new winston.transports.File({ filename: 'error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'combined.log' })
+    ]
+});
+
+// Schema validation
+const productSchema = Joi.object({
+    url: Joi.string().uri().required(),
+    name: Joi.string().required(),
+    price: Joi.string().required()
+});
+
+// Metrics
+const crawlDuration = new promClient.Histogram({
+    name: 'crawl_duration_seconds',
+    help: 'Duration of crawling in seconds'
+});
 
 await Actor.init();
 
-
-// Bước 1: Crawl trang danh mục để lấy link sản phẩm
-const productLinks = [];
+// Sử dụng Set để lưu trữ links
+const productLinks = new Set();
 
 const categoryCrawler = new PlaywrightCrawler({
     async requestHandler({ page, log }) {
-        log.info('Đang lấy danh sách link sản phẩm...');
-        await page.waitForLoadState('networkidle');
-        // Lấy tất cả link sản phẩm từ trang danh mục
-        const links = await page.$$eval('a', as =>
-            as.map(a => a.href).filter(href =>
-                href.includes('/gach-') && href.includes('.html')
-            )
-        );
-        // Loại bỏ trùng lặp
-        links.forEach(link => {
-            if (!productLinks.includes(link)) productLinks.push(link);
-        });
-        log.info(`Tìm thấy ${productLinks.length} link sản phẩm.`);
+        const timer = crawlDuration.startTimer();
+        try {
+            log.info('Đang lấy danh sách link sản phẩm...');
+            await page.waitForLoadState('networkidle');
+
+            const links = await page.$$eval('a', as =>
+                as.map(a => a.href)
+                    .filter(href => href.includes('/gach-') && href.includes('.html'))
+            );
+
+            // Thêm vào Set (tự động loại bỏ trùng lặp)
+            links.forEach(link => productLinks.add(link));
+
+            log.info(`Tìm thấy ${productLinks.size} link sản phẩm.`);
+        } catch (error) {
+            logger.error(`Lỗi khi crawl danh mục: ${error.message}`);
+        } finally {
+            timer();
+        }
     },
     maxRequestsPerCrawl: 1,
     maxConcurrency: 1,
 });
 
-await categoryCrawler.run(['https://b2b.daisan.vn/gach-lat-nen-30x30-catalan-3345-432456.html']);
+// Cấu hình proxy (bỏ comment và thay thế bằng proxy thật khi cần)
+// const proxyUrl = await ProxyChain.anonymizeProxy('http://user:pass@proxy.example.com:8080');
 
-// Bước 2: Crawl từng trang detail để lấy thông tin
 const detailCrawler = new PlaywrightCrawler({
     async requestHandler({ page, request, log, pushData }) {
-        log.info(`Đang xử lý: ${request.url}`);
-        await page.waitForLoadState('networkidle');
+        const timer = crawlDuration.startTimer();
         try {
+            log.info(`Đang xử lý: ${request.url}`);
+            await page.waitForLoadState('networkidle');
+
             const name = await page.$eval('h1', el => el.textContent.trim()).catch(() => null);
             let price = null;
+
+            // Logic lấy price
             price = await page.$eval('.price', el => el.textContent.trim()).catch(() => null);
             if (!price) {
                 price = await page.$eval('span.price', el => el.textContent.trim()).catch(() => null);
@@ -52,25 +89,32 @@ const detailCrawler = new PlaywrightCrawler({
                     }
                 }
             }
+
             const productData = { url: request.url, name, price };
-            // Ghi vào file output.json
 
-            pushData(productData);
+            // Validate dữ liệu
+            const { error, value } = productSchema.validate(productData);
+            if (error) {
+                logger.error(`Validation error: ${error.message}`);
+                return;
+            }
 
-            // if (!isFirst) {
-            //     fs.appendFileSync('output.json', ',\n');
-            // }
-            // fs.appendFileSync('output.json', JSON.stringify(productData, null, 2));
-            // isFirst = false;
-            // log.info(`Đã lưu: ${JSON.stringify(productData)}`);
+            // Lưu dữ liệu đã validate
+            pushData(value);
+            logger.info(`Đã lưu sản phẩm: ${value.name}`);
+
         } catch (error) {
-            log.error(`Lỗi khi xử lý trang ${request.url}: ${error.message}`);
+            logger.error(`Lỗi khi xử lý trang ${request.url}: ${error.message}`);
+        } finally {
+            timer();
         }
     },
     maxRequestsPerCrawl: 20,
     maxConcurrency: 5,
     maxRequestRetries: 3,
+    // proxyUrl, // Bỏ comment khi cần dùng proxy
 });
 
-await detailCrawler.run(productLinks);
+await categoryCrawler.run(['https://b2b.daisan.vn/gach-lat-nen-30x30-catalan-3345-432456.html']);
+await detailCrawler.run([...productLinks]);
 await Actor.exit();
